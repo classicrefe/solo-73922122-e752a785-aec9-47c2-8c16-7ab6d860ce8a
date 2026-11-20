@@ -1,12 +1,19 @@
-"""FastAPI 入口：SQL 改写有界等价核对 API。"""
+"""FastAPI 入口：SQL 改写有界等价核对 + 质控增量 SQL 生成 API。"""
 from __future__ import annotations
 
 import os
 
 from fastapi import Body, FastAPI, HTTPException
 
+from .incremental import build_incremental_sql
 from .ir import MAX_ROWS
-from .models import CheckRequest, CheckResponse, Counterexample
+from .models import (
+    CheckRequest,
+    CheckResponse,
+    Counterexample,
+    IncrementalRequest,
+    IncrementalResponse,
+)
 from .sql_parser import SqlRejected, parse_query
 from .verifier import Verifier, setup_sql
 from .z3check import check_bounded_equivalence
@@ -22,8 +29,10 @@ app = FastAPI(
         "按列位置比较结果多重集（忽略顺序、保留重复）。"
         "差异会在隔离 PostgreSQL 中实际复现后才报 NOT_EQUIVALENT；"
         "界内无反例报 EQUIVALENT；求解或复现失败报 UNKNOWN。"
+        "另提供 POST /incremental：把 stations 左连接 readings 的质控 SELECT "
+        "转成读数补传场景下的 PostgreSQL 增量 SQL（净新增/净撤回明细与次数）。"
     ),
-    version="1.0.0",
+    version="1.1.0",
 )
 
 _QUERY_EXAMPLES = {
@@ -72,6 +81,40 @@ _QUERY_EXAMPLES = {
 }
 
 
+_INCREMENTAL_EXAMPLES = {
+    "backfill-threshold-filter": {
+        "summary": "读数补传：阈值值阈值过滤的净新增/净撤回",
+        "value": {
+            "query": (
+                "SELECT s.id, r.value FROM stations s "
+                "LEFT JOIN readings r ON s.id = r.station_id "
+                "WHERE r.value >= 10 OR r.value IS NULL"
+            ),
+        },
+    },
+    "backfill-null-placeholder-retract": {
+        "summary": "首条读数使补空行消失（即便读数被 WHERE 排除）",
+        "value": {
+            "query": (
+                "SELECT s.id, r.value FROM stations s "
+                "LEFT JOIN readings r ON s.id = r.station_id "
+                "WHERE r.value IS NULL"
+            ),
+        },
+    },
+    "backfill-station-and-reading-conditions": {
+        "summary": "站点与读数混合条件、多列投影",
+        "value": {
+            "query": (
+                "SELECT s.id, s.threshold, r.value FROM stations s "
+                "LEFT JOIN readings r ON s.id = r.station_id "
+                "WHERE s.threshold >= 0 AND (r.value < 100 OR r.value IS NULL)"
+            ),
+        },
+    },
+}
+
+
 def _dsn() -> str:
     return os.environ.get("DATABASE_URL", DEFAULT_DSN)
 
@@ -88,6 +131,7 @@ def root() -> dict:
         "service": "sql-equivalence-checker",
         "docs": "/docs",
         "check_endpoint": "POST /check",
+        "incremental_endpoint": "POST /incremental",
         "bound_rows_per_table": MAX_ROWS,
     }
 
@@ -150,5 +194,38 @@ def check_equivalence(
             setup_sql=setup_sql(outcome.witness),
             query_a_result=repro.query_a_result or [],
             query_b_result=repro.query_b_result or [],
+        ),
+    )
+
+
+@app.post(
+    "/incremental",
+    response_model=IncrementalResponse,
+    summary="把质控 SELECT 转成读数补传的增量 SQL",
+)
+def build_incremental(
+    req: IncrementalRequest = Body(openapi_examples=_INCREMENTAL_EXAMPLES),
+) -> IncrementalResponse:
+    """把一条质控 SELECT 转成可执行的 PostgreSQL 增量 SQL。
+
+    仅接受 stations 按 id = station_id 左连接 readings 的查询；生成的 SQL
+    在目标库执行时假设存在 stations、readings（入仓前存量）与 new_readings
+    （同结构、已通过外键校验的待追加批次），只重算该批涉及的站点。
+    """
+    try:
+        ir = parse_query(req.query)
+        sql = build_incremental_sql(ir)
+    except SqlRejected as exc:
+        raise HTTPException(status_code=400, detail=f"SQL 不满足增量转换要求: {exc}")
+    return IncrementalResponse(
+        delta_sql=sql.delta_sql,
+        count_sql=sql.count_sql,
+        projection=list(sql.projection),
+        required_tables=["stations", "readings", "new_readings"],
+        message=(
+            "增量 SQL 已生成：在目标库执行 delta_sql 得净新增('added')/净撤回"
+            "('removed')明细行，执行 count_sql 得两类次数；只重算 new_readings "
+            "涉及的站点，结果与全量重跑的差额一致（多重集语义：按列位置、"
+            "NULL 视为相同、重复逐次计数）。"
         ),
     )

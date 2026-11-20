@@ -59,3 +59,53 @@ class CheckResponse(BaseModel):
     counterexample: Counterexample | None = Field(
         None, description="verdict=NOT_EQUIVALENT 时给出可复现的反例"
     )
+
+
+class IncrementalRequest(BaseModel):
+    query: str = Field(
+        ...,
+        description=(
+            "质控 SELECT：必须是 stations 按 id = station_id 左连接 readings，"
+            "列投影与 WHERE 沿用 /check 的受支持子集"
+        ),
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "query": (
+                        "SELECT s.id, r.value FROM stations s "
+                        "LEFT JOIN readings r ON s.id = r.station_id "
+                        "WHERE r.value >= 10 OR r.value IS NULL"
+                    )
+                }
+            ]
+        }
+    }
+
+
+class IncrementalResponse(BaseModel):
+    delta_sql: str = Field(
+        ...,
+        description=(
+            "单条 SELECT：返回净增量明细行 (delta, c1..cN)，"
+            "delta='added' 为净新增（需补发）、'removed' 为净撤回（需撤回）；"
+            "多重集语义：按列位置、NULL 视为相同、重复逐次计数"
+        ),
+    )
+    count_sql: str = Field(
+        ...,
+        description="单条 SELECT：返回 (delta, n) 两行，分别给出净新增/净撤回次数",
+    )
+    projection: list[str] = Field(
+        ..., description="明细列 c1..cN 对应的原始投影列（table.column，按位置）"
+    )
+    required_tables: list[str] = Field(
+        ...,
+        description=(
+            "执行生成的 SQL 时目标库必须存在的表：stations、readings（入仓前存量）、"
+            "new_readings（同结构且已通过外键校验的待追加批次）"
+        ),
+    )
+    message: str = Field(..., description="生成说明")

@@ -84,12 +84,73 @@ curl -s -X POST http://localhost:8000/check \
        "query_b":"SELECT id FROM stations"}'
 ```
 
+### `POST /incremental`
+
+读数补传入仓场景：把一条质控 SELECT 转成可执行的 PostgreSQL **增量 SQL**，
+下游据此补发 / 撤回质控结果，无需全量重跑。
+
+```json
+{
+  "query": "SELECT s.id, r.value FROM stations s LEFT JOIN readings r ON s.id = r.station_id WHERE r.value >= 10 OR r.value IS NULL"
+}
+```
+
+响应：
+
+```json
+{
+  "delta_sql": "WITH affected AS (...), old_rows AS (...), new_rows AS (...), added AS (...), removed AS (...) SELECT 'added' AS delta, c1, c2 FROM added UNION ALL SELECT 'removed', c1, c2 FROM removed",
+  "count_sql": "SELECT k.delta, COALESCE(d.n, 0) AS n FROM (VALUES ('added'), ('removed')) ...",
+  "projection": ["stations.id", "readings.value"],
+  "required_tables": ["stations", "readings", "new_readings"],
+  "message": "增量 SQL 已生成：..."
+}
+```
+
+- **接受的查询形态**：仅 `stations LEFT [OUTER] JOIN readings ON
+  stations.id = readings.station_id`（ON 两侧顺序、表别名任意），列投影与
+  WHERE 沿用上述受支持子集；其余形态（INNER JOIN、单表、readings 驱动、
+  其他连接列）返回 400。
+- **执行前提**：目标库存在 `stations`、`readings`（入仓前存量）与
+  `new_readings`（与 readings 同结构、已通过外键校验的待追加批次）。
+- **语义**：`delta_sql` 返回明细行 `(delta, c1..cN)`——`added` 为净新增
+  （需补发）、`removed` 为净撤回（需撤回），`c1..cN` 按 `projection`
+  顺序对应原投影列；`count_sql` 返回 `(delta, n)` 两行给出两类次数
+  （无行时次数为 0）。只重算 `new_readings` 涉及的站点（`station_id`
+  为 NULL 的批次行不参与连接，自动忽略），结果与"全量重跑
+  readings ∪ new_readings 再求差"一致。
+- **多重集语义**：按列位置比较、两个 NULL 视为相同、重复行逐次计数
+  （由 PostgreSQL `EXCEPT ALL` 保证）。
+- **补空行陷阱**：站点原本无读数时左连接输出一行 readings 全 NULL 的
+  补空行；该站首条读数到批后，即便这条读数本身被 WHERE 排除，补空行
+  也会消失——它会正确出现在净撤回中。
+
+执行示例（psql）：
+
+```sql
+-- 假设业务库已有 stations / readings，先装载待追加批次
+CREATE TABLE new_readings (station_id INTEGER REFERENCES stations(id), value INTEGER);
+\copy new_readings FROM 'batch.csv' CSV
+-- 粘贴执行 delta_sql / count_sql，把结果推给下游补发或撤回
+-- 核对无误后合入：
+INSERT INTO readings SELECT * FROM new_readings;
+```
+
+curl 示例：
+
+```bash
+curl -s -X POST http://localhost:8000/incremental \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"SELECT s.id, r.value FROM stations s LEFT JOIN readings r ON s.id = r.station_id WHERE r.value >= 10 OR r.value IS NULL"}'
+```
+
 ### 其他端点
 
 - `GET /`：服务信息；
 - `GET /health`：健康检查（含数据库连通性）；
 - `GET /docs`：Swagger 交互文档，内置等价 / 不等价（NULL 语义、LEFT JOIN
-  重复行）等命名示例，可直接 "Try it out"。
+  重复行）及增量 SQL（阈值过滤、补空行撤回、混合条件）等命名示例，
+  可直接 "Try it out"。
 
 ## 判定原理
 
@@ -114,13 +175,21 @@ curl -s -X POST http://localhost:8000/check \
 ```bash
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt
-pytest tests/                       # 单元测试（解析器 / z3 / API 打桩）
-DATABASE_URL=postgresql://... pytest tests/test_e2e.py   # 端到端（需真实 PG）
+pytest tests/                       # 单元测试（解析器 / z3 / 增量 SQL 生成 / API 打桩）
+DATABASE_URL=postgresql://... pytest tests/test_e2e.py tests/test_incremental_e2e.py   # 端到端（需真实 PG）
 ```
+
+`tests/test_incremental_e2e.py` 会在真实 PostgreSQL 中执行生成的增量 SQL，
+并与"全量重跑 readings ∪ new_readings 再求差"的结果逐例比对（含补空行
+撤回、重复行计数、NULL 值 / NULL 外键、空批次等场景）。
 
 ## 已知边界
 
 - 等价结论仅限每表 ≤3 行（有界模型检验，非全量证明）；
 - 仅支持上述 SQL 子集；两查询投影列数不一致返回 400；
 - 复现使用单事务 + 临时 schema，不在库中留存对象；数据库不可达时
-  不等价判定降级为 `UNKNOWN`（等价判定不依赖数据库）。
+  不等价判定降级为 `UNKNOWN`（等价判定不依赖数据库）；
+- `/incremental` 仅接受 stations 左连接 readings 的固定连接形态；
+  生成 SQL 的正确性依赖执行前提：`new_readings` 与 `readings` 同结构、
+  批次已通过外键校验、执行期间三表无并发写（建议在单事务内执行
+  delta_sql 后再合入批次）。
